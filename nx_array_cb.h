@@ -1,5 +1,5 @@
 ﻿// nx_array - реализация динамического массива, гарантирующего стабильность указателей и доступ через []
-// Версия модуля: 2026-11-11 release / C++Builder 10, Clang Win32/Win64 (C++11)
+// Версия модуля: 2026-11-12 release / C++Builder 10, Clang Win32/Win64 (C++11)
 #ifndef NX_ARRAY_H
 #define NX_ARRAY_H
 
@@ -530,6 +530,9 @@ private:
 
    // Replacement inherits ownership only after both the nodes and the index are ready.
    template<class U, class A>
+#if defined(__BORLANDC__) && defined(__clang__) && !defined(_WIN64) && defined(_CPPLIB_VER) && _CPPLIB_VER == 803
+   __attribute__((optnone))
+#endif
    void move_values(nx_array<U,A>& source)
    {
       list_type pending(data_list.get_allocator());
@@ -540,20 +543,46 @@ private:
       source.isDeleteItemsOnDestroy = false;
    }
 
-   void move_storage(nx_array& source, std::true_type)
+   // retired belongs to operator=: source may live inside an old element.
+   void move_storage(nx_array& source, list_type& retired, std::true_type)
    {
       internal_reserve((std::max)(size(), source.size()));
-      data_list = std::move(source.data_list);
+      retired.splice(retired.end(), data_list);
+      try
+      {
+#if defined(__BORLANDC__) && defined(__clang__) && defined(_CPPLIB_VER) && _CPPLIB_VER == 803
+         // Dinkumware 803 moves allocators but swaps sentinels without rebinding
+         // the source allocator. Swap each sentinel with its allocator instead.
+         data_list._Swap_all(source.data_list);
+         std::swap(data_list._Getal(), source.data_list._Getal());
+         std::swap(data_list._Myhead(), source.data_list._Myhead());
+         std::swap(data_list._Mysize(), source.data_list._Mysize());
+#else
+         data_list = std::move(source.data_list);
+#endif
+      }
+      catch(...)
+      {
+         // Some list implementations allocate a replacement sentinel on move.
+         // Restore the old nodes when that allocation fails before transfer.
+         if(data_list.empty() && data_list.get_allocator() == retired.get_allocator())
+            data_list.splice(data_list.end(), retired);
+         else
+            isDeleteItemsOnDestroy = source.isDeleteItemsOnDestroy;
+         rebuild_pointers();
+         source.rebuild_pointers();
+         throw;
+      }
       rebuild_pointers();
    }
 
-   void move_storage(nx_array& source, std::false_type)
+   void move_storage(nx_array& source, list_type& retired, std::false_type)
    {
       if(source.size() > max_size()) throw std::length_error("NxArray: move exceeds max_size()");
       if(data_list.get_allocator() == source.data_list.get_allocator())
       {
          internal_reserve((std::max)(capacity(), source.size()));
-         data_list.clear();
+         retired.splice(retired.end(), data_list);
          data_list.splice(data_list.end(), source.data_list);
          rebuild_pointers();
       }
@@ -562,7 +591,24 @@ private:
          list_type pending(data_list.get_allocator());
          stage_transfer(pending, source, max_size());
          replace_pending(pending);
+         retired.splice(retired.end(), pending);
       }
+   }
+
+   // Keep the replaced elements alive through clear_source as well as staging.
+   // A source container can be a member of an object owned by those elements.
+   template<class Container>
+#if defined(__BORLANDC__) && defined(__clang__) && !defined(_WIN64) && defined(_CPPLIB_VER) && _CPPLIB_VER == 803
+   // BCC32X 7.50 -O2 miscompiles exceptional cleanup in these staging scopes.
+   __attribute__((optnone))
+#endif
+   void replace_and_drain(Container& source)
+   {
+      list_type pending(data_list.get_allocator());
+      stage_range(pending, std::make_move_iterator(source.begin()),
+                  std::make_move_iterator(source.end()), max_size());
+      replace_pending(pending);
+      clear_source(source, 0);
    }
 
    template<class U, class A>
@@ -1357,7 +1403,8 @@ public:
    {
       if(this != &other_array)
       {
-         move_storage(other_array, typename std::allocator_traits<Allocator>::propagate_on_container_move_assignment());
+         list_type retired(data_list.get_allocator());
+         move_storage(other_array, retired, typename std::allocator_traits<Allocator>::propagate_on_container_move_assignment());
          isDeleteItemsOnDestroy = other_array.isDeleteItemsOnDestroy;
          other_array.isDeleteItemsOnDestroy = false;
          other_array.clear();
@@ -1401,8 +1448,7 @@ public:
 
    nx_array& operator=(std::vector<T>&& vec) &
    {
-      assign(std::make_move_iterator(vec.begin()), std::make_move_iterator(vec.end()));
-      vec.clear();
+      replace_and_drain(vec);
       return *this;
    }
 
@@ -1428,8 +1474,15 @@ public:
    nx_array& operator=(list_type&& lst) &
    {
       if(lst.size() > max_size()) throw std::length_error("NxArray: replacement exceeds max_size()");
-      list_type pending(std::move(lst), data_list.get_allocator());
+      list_type pending(data_list.get_allocator());
+      if(pending.get_allocator() == lst.get_allocator())
+         pending.splice(pending.end(), lst);
+      else
+         stage_selected(pending, std::make_move_iterator(lst.begin()),
+                        std::make_move_iterator(lst.end()), max_size(),
+                        typename std::is_move_constructible<T>::type());
       replace_pending(pending);
+      lst.clear();
       return *this;
    }
 
@@ -1454,8 +1507,7 @@ public:
 
    nx_array& operator=(std::deque<T>&& deq) &
    {
-      assign(std::make_move_iterator(deq.begin()), std::make_move_iterator(deq.end()));
-      deq.clear();
+      replace_and_drain(deq);
       return *this;
    }
 
@@ -2257,6 +2309,9 @@ public:
 //--
 
    template <class InputIt>
+#if defined(__BORLANDC__) && defined(__clang__) && !defined(_WIN64) && defined(_CPPLIB_VER) && _CPPLIB_VER == 803
+   __attribute__((optnone))
+#endif
    void assign(InputIt first, InputIt last, typename std::enable_if<!std::is_integral<InputIt>::value>::type* = nullptr)
    {
       list_type pending(data_list.get_allocator());
@@ -2295,8 +2350,7 @@ public:
    auto assign(Container&& cont) -> typename std::enable_if<!std::is_lvalue_reference<Container>::value, decltype(cont.begin(), cont.end(), void())>::type
    {
       if(static_cast<const void*>(this) == static_cast<const void*>(std::addressof(cont))) return;
-      assign(std::make_move_iterator(cont.begin()), std::make_move_iterator(cont.end()));
-      clear_source(cont, 0);
+      replace_and_drain(cont);
    }
 //---------------------------------------------------------------------------------------------------------------------------------------------------
 
